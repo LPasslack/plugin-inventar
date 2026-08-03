@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""plugin-inventar: inventory and change comparison for Claude Code plugins."""
+import argparse
+import hashlib
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+
+VERSION = "0.1.0"
+
+# A trailing path segment that looks like a version: 1.2.3, v2, a commit SHA,
+# or the literal "unknown" that the cache uses when no version is declared.
+_VERSION_PATTERN = re.compile(r"^(v?\d+[\w.\-+]*|[0-9a-f]{7,40}|unknown)$", re.I)
+
+
+class _Parser(argparse.ArgumentParser):
+    """Argument parser that keeps exit code 2 free.
+
+    argparse ends a usage error with 2, and 2 already means "there is no
+    plugin here". A script checking for it would take a typo in an option
+    for a statement about the directory.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: Fehler: {message}\n")
+
+
+def parse_args(argv):
+    parser = _Parser(
+        prog="plugin-inventar",
+        description="Inventory a Claude Code plugin and compare it "
+                    "against the last recorded state.",
+        add_help=False,
+    )
+    parser.add_argument("path", nargs="?", metavar="PATH",
+                        help="a single plugin directory "
+                             "(default: every installed plugin)")
+    parser.add_argument("--as", dest="key", metavar="KEY",
+                        help="compare under this key")
+    parser.add_argument("--json", action="store_true", dest="as_json",
+                        help="print the state as JSON")
+    parser.add_argument("--no-save", action="store_true", dest="dry_run",
+                        help="do not record the state")
+    parser.add_argument("--version", action="version",
+                        version=f"plugin-inventar {VERSION}",
+                        help="print the version")
+    parser.add_argument("-h", "--help", action="help",
+                        help="show this help")
+    return parser.parse_args(argv)
+
+
+def state_key_for(root):
+    """Build a state key that survives an update.
+
+    Two requirements that pull in opposite directions: the key has to tell two
+    equally named plugins in different places apart, and it has to stay the
+    same across a version bump.
+
+    The location alone is not enough. Installed plugins live under
+    …/cache/<market>/<plugin>/<version>/, so the version is part of the path. A
+    hash over it produces a fresh key on every update, and the comparison fails
+    exactly when it is needed.
+
+    Hence: recognise the cache layout and derive <plugin>@<market> from it.
+    Otherwise use the location, but skip a trailing version-like directory.
+
+    Two things the key must NOT depend on:
+
+    - The manifest name. It used to be part of the local key, so a plugin that
+      renamed itself got a fresh state file and the whole diff vanished --
+      erased by editing one string in the very file being inspected.
+    - Only the tail of the path. Matching a bare "cache" anywhere and taking
+      the two segments after it put two unrelated plugins under one key, and
+      then compared them against each other. The part in front is hashed in,
+      and the layout is only accepted when the segment where the version
+      belongs actually looks like one.
+    """
+    real = os.path.realpath(root)
+    parts = real.split(os.sep)
+    if "cache" in parts:
+        index = len(parts) - 1 - parts[::-1].index("cache")
+        # cache / <market> / <plugin> / <version>, and nothing below it.
+        # Deliberately WITHOUT checking that the last segment looks like a
+        # version: that string comes from the marketplace manifest, so
+        # requiring it would let the publisher decide whether a comparison
+        # happens at all. "nightly" fell through to the local branch and got
+        # a different key.
+        if len(parts) == index + 4:
+            prefix = os.sep.join(parts[:index])
+            digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:8]
+            return f"{parts[index + 2]}@{parts[index + 1]}-{digest}"
+    location = real
+    if _VERSION_PATTERN.match(os.path.basename(real)):
+        location = os.path.dirname(real)
+    digest = hashlib.sha256(location.encode("utf-8")).hexdigest()[:12]
+    return f"{digest}@local"
+
+
+def _save_quietly(key, state, problems=None):
+    """Write the state, and never let that failure end the run.
+
+    The report is already correct and on stdout by then. A state directory
+    that cannot be written must not turn that into a traceback and exit 1 --
+    the plugin was perfectly readable.
+    """
+    from inventory.state import save
+    try:
+        save(key, state)
+    except OSError as exc:
+        # The sweep's headline says "this is your baseline from now on". If
+        # nothing was written, that sentence is false, so the caller has to
+        # learn about it and not only stderr.
+        if problems is not None:
+            problems.append(str(exc))
+        print(f"State not saved: {exc}", file=sys.stderr)
+
+
+def sweep_keys(records):
+    """Give every installation its own state key, and say when two share a home.
+
+    `state_key_for` deliberately drops the version segment so a comparison
+    survives an update. That is right for one installation and wrong for two:
+    the same plugin at user and project scope lands on one key, and then each
+    run compares one against the state the OTHER wrote seconds earlier. Both
+    report a change forever, and a real change drowns in that noise.
+
+    Returns (keyed, findings). Records pointing at the SAME directory are not
+    two installations, they are one under two names -- inventoried once,
+    with a finding, because silently dropping one is what this tool exists
+    against.
+    """
+    findings = []
+    by_path = {}
+    for record in records:
+        by_path.setdefault(os.path.realpath(
+            os.path.expanduser(record["path"])), []).append(record)
+
+    keyed = []
+    for path in sorted(by_path):
+        group = by_path[path]
+        if len(group) > 1:
+            findings.append({"code": "duplicate-id", "path": group[0]["key"],
+                             "category": None, "detail": "collides-with",
+                             "detail_arg": ", ".join(r["key"] for r in group[1:])})
+        keyed.append(dict(group[0], path=path))
+
+    # Two directories, one derived key -- the cache layout drops the version
+    # segment on purpose, so the same plugin at two scopes lands on one key.
+    # Which one keeps the bare key is decided by the SCOPE, not by position in
+    # the list. Letting the first record keep it made the key depend on which
+    # OTHER records happened to be present: uninstall the user-scope copy and
+    # the project copy inherits its state, then reports a changed version, a
+    # changed manifest and a full set of added and removed commands about a
+    # directory nobody touched.
+    #
+    # `user` keeps the bare key because that is also the key a single-path run
+    # derives, and the two modes have to meet in the same state file.
+    #
+    # `taken` is a set and is tested as one. The old loop asked `any(... for r
+    # in keyed)` inside a loop over keyed, which is quadratic in the number of
+    # installed plugins before a single directory is read: 1.600 registry
+    # entries took two minutes, 6.400 would take over an hour.
+    taken = set()
+    for record in keyed:
+        base = state_key_for(record["path"])
+        scope = record.get("scope") or "other"
+        candidate = base if scope == "user" else f"{base}#{scope}"
+        stem, index = candidate, 2
+        while candidate in taken:
+            candidate, index = f"{stem}{index}", index + 1
+        taken.add(candidate)
+        record["state_key"] = candidate
+    keyed.sort(key=lambda r: (r["key"], r["state_key"]))
+    return keyed, findings
+
+
+def sweep(args):
+    """Run over every installed plugin and report the differences together.
+
+    This is what makes the tool useful on the day someone installs it: one
+    command takes the baseline for everything, and the run two weeks later
+    is the one it was built for. Before this, that first step meant knowing
+    the cache layout and typing one path per plugin.
+    """
+    import datetime
+
+    from inventory.collect import build_inventory
+    from inventory.installed import installed_plugins
+    from inventory.report import render_sweep
+    from inventory.state import SCHEMA, diff, load
+
+    records, findings = installed_plugins()
+    if records:
+        records, collisions = sweep_keys(records)
+        findings.extend(collisions)
+    if not records:
+        print("Keine installierten Plugins gefunden.", file=sys.stderr)
+        from inventory.report import detail_text, finding_text, shorten, visible
+        for finding in findings:
+            # The path here is the registry key, so foreign text. This was
+            # the one output path in the tool that skipped escaping, and
+            # stderr is exactly what the slash command hands to the model.
+            spelled = detail_text(finding)
+            extra = f" ({visible(shorten(spelled))})" if spelled else ""
+            print(f"Finding {visible(shorten(finding_text(finding['code'])))}: "
+                  f"{visible(shorten(str(finding['path'])))}{extra}",
+                  file=sys.stderr)
+        return 2
+
+    stamp = (datetime.datetime.now(datetime.timezone.utc)
+             .strftime("%Y-%m-%dT%H:%M:%SZ"))
+    results, problems = [], []
+    for record in records:
+        root = os.path.abspath(record["path"])
+        if not os.path.isdir(root):
+            # The registry lists it, the directory is gone. Saying nothing
+            # would be the one thing this tool must not do.
+            findings.append({"code": "declared-path-missing", "path": record["key"],
+                             "category": None, "detail": ""})
+            continue
+        inventory = build_inventory(root)
+        if not inventory["entries"]:
+            # The single-directory run ends with "There is no plugin here" for
+            # this. Counting it as a checked, unchanged plugin forever is the
+            # kind of quiet number that reassures without meaning anything.
+            findings.extend(inventory["findings"])
+            findings.append({"code": "present-but-not-loaded", "path": record["key"],
+                             "category": None, "detail": ""})
+            continue
+        key = record["state_key"]
+        previous, load_reason = load(key)
+        note = load_reason
+        if previous is None:
+            differences = None
+        elif previous.get("meta", {}).get("schema") != SCHEMA:
+            differences, note = None, "different schema"
+        else:
+            differences = diff(previous["inventory"], inventory)
+        results.append({**record, "differences": differences, "note": note,
+                        "previous_path": (previous or {}).get("meta", {}).get("path"),
+                        "path": root})
+        if not args.dry_run:
+            _save_quietly(key, {
+                "meta": {"tool": f"plugin-inventar/{VERSION}", "schema": SCHEMA,
+                         "read_at": stamp, "path": root, "key": key},
+                "inventory": inventory}, problems)
+    print(render_sweep(results, findings, unsaved=problems))
+    return 0
+
+
+def main(argv=None):
+    import datetime
+    import json
+
+    from inventory.collect import build_inventory
+    from inventory.report import detail_text, finding_text, render, shorten, visible
+    from inventory.state import SCHEMA, diff, load
+
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.key is not None and not args.key.strip():
+        print("--as needs a non-empty key.", file=sys.stderr)
+        return 1
+    if args.path is None:
+        if args.key:
+            print("--as applies to a single directory, name one.",
+                  file=sys.stderr)
+            return 1
+        if args.as_json:
+            print("--json applies to a single directory, name one.",
+                  file=sys.stderr)
+            return 1
+        return sweep(args)
+    root = os.path.abspath(os.path.expanduser(args.path))
+    if not os.path.isdir(root):
+        print(f"Kein Verzeichnis: {root}", file=sys.stderr)
+        return 1
+
+    inventory = build_inventory(root)
+    if not inventory["entries"]:
+        # Still show the findings. Otherwise the tool swallows the reason why
+        # nothing was found -- for instance that a declared path pointed out of
+        # the plugin and was therefore rejected.
+        for finding in inventory["findings"]:
+            spelled = detail_text(finding)
+            detail = f" ({visible(shorten(spelled))})" if spelled else ""
+            # shorten as well, not just visible: this was the one output path
+            # without it, and a 200 kB path from a manifest went out in full
+            # -- into the model's context, because the slash command passes
+            # stderr along.
+            print(f"Finding {visible(shorten(finding_text(finding['code'])))}: "
+                  f"{visible(shorten(finding['path']))}{detail}", file=sys.stderr)
+        print("There is no plugin here.", file=sys.stderr)
+        return 2
+
+    key = args.key or state_key_for(root)
+    state = {
+        "meta": {
+            "tool": f"plugin-inventar/{VERSION}",
+            "schema": SCHEMA,
+            "read_at": datetime.datetime.now(datetime.timezone.utc)
+                               .strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "path": root,
+            "key": key,
+        },
+        "inventory": inventory,
+    }
+
+    if args.as_json:
+        print(json.dumps(state, sort_keys=True, indent=2, ensure_ascii=True))
+        if not args.dry_run:
+            _save_quietly(key, state)
+        return 0
+
+    previous, load_reason = load(key)
+    # Whatever gets in the way of a comparison has to travel on the SAME stream
+    # as the report. It used to go to stderr while stdout kept saying "first
+    # run" -- so redirecting into a file, piping, or the slash command's `!`
+    # call all dropped the correction and kept the false reassurance.
+    note = None
+    if previous is None:
+        differences = None
+        if load_reason:
+            note = f"A previous state exists but cannot be used ({load_reason}), no comparison."
+    elif previous.get("meta", {}).get("schema") != SCHEMA:
+        # Better no comparison at all than an avalanche of false alarms.
+        differences = None
+        note = "The saved state uses a different schema, comparison skipped."
+    else:
+        differences = diff(previous["inventory"], inventory)
+
+    # B3: without this the reader cannot tell what was compared against. Two
+    # different directories can share one key, and "no changes" then reads
+    # like a statement about this directory when it is not.
+    since = None
+    if differences is not None:
+        stated = args.key is not None
+        since = (previous.get("meta", {}).get("read_at"), key,
+                 None if stated else previous.get("meta", {}).get("path"),
+                 root)
+    print(render(inventory, differences, note=note, since=since))
+    if not args.dry_run:
+        _save_quietly(key, state)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # 130 is the shell convention for "ended by SIGINT".
+        sys.exit(130)
+    except BrokenPipeError:
+        # `| head -3` closes the pipe. Python would otherwise print
+        # "Exception ignored while flushing sys.stdout" at interpreter exit,
+        # so the descriptor is redirected to devnull before that happens.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(120)

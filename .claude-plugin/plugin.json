@@ -1,0 +1,9 @@
+{
+  "name": "plugin-inventar",
+  "description": "Inventarisiert Claude-Code-Plugins und meldet, was sich seit dem letzten Lauf geändert hat.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Leif Passlack"
+  },
+  "license": "MIT"
+}

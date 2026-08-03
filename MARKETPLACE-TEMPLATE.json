@@ -1,0 +1,13 @@
+{
+  "name": "appx-patterns",
+  "owner": {
+    "name": "Leif Passlack"
+  },
+  "plugins": [
+    {
+      "name": "plugin-inventar",
+      "source": "https://github.com/<user>/plugin-inventar",
+      "description": "Inventarisiert Claude-Code-Plugins und meldet, was sich seit dem letzten Lauf geändert hat."
+    }
+  ]
+}
