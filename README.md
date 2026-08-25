@@ -38,9 +38,13 @@ schauen soll, darf das Plugin nicht starten.
 ## Installieren
 
 ```
-claude plugin marketplace add <benutzer>/plugin-inventar
+claude plugin marketplace add LPasslack/plugin-inventar
 claude plugin install plugin-inventar@appx-patterns
+/reload-plugins
 ```
+
+Die dritte Zeile sieht überflüssig aus, ist sie aber nicht: Ohne sie kennt die laufende
+Sitzung den neuen Befehl noch gar nicht.
 
 Der Katalog liegt im Repo selbst (`.claude-plugin/marketplace.json`) und zeigt mit `./`
 auf die Wurzel. Ein absoluter Pfad als Quelle wird abgelehnt, ein relativer und eine
